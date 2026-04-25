@@ -6,6 +6,10 @@ Eksekutor order ke Polymarket via CLOB (Central Limit Order Book) API.
 Revisi:
   - Implementasi Gamma API Slug Fetching berdasarkan dokumentasi Polymarket.
   - Generasi Timestamp akurat untuk membidik market 5-menit (interval 300 detik).
+
+FIXES:
+  - BUG #2: _place_gtc() sekarang pakai LimitOrderArgs object (bukan dict)
+            agar tidak crash dengan "'dict' object has no attribute 'token_id'"
 """
 
 import logging
@@ -164,7 +168,7 @@ class PolymarketExecutor:
         except Exception as e:
             logger.error(f"[Executor] Init error: {e}")
 
-    # ── VALIDATOR SAFETY (Opsional untuk fallback) ────────────
+    # ── VALIDATOR SAFETY ──────────────────────────────────────
 
     def _is_target_window(self, end_date_str: str) -> bool:
         if not end_date_str:
@@ -254,7 +258,6 @@ class PolymarketExecutor:
                 and (now - self._market_cache_ts.get(coin, 0)) < 30):
             return self._market_cache[coin]
 
-        # Prioritaskan pemanggilan langsung ke API Events dengan Slug Akurat
         result = (
             self._fetch_market_via_events(coin)
             or self._fetch_market_via_clob(coin)
@@ -269,54 +272,37 @@ class PolymarketExecutor:
         return result or self._market_cache.get(coin)
 
     def _fetch_market_via_events(self, coin: str) -> Optional[dict]:
-        """
-        [BARU] Mencari market spesifik berdasarkan rumusan API Docs.
-        Alih-alih mencari teks, bot membangkitkan (generate) exact slug
-        berdasarkan timestamp UTC karena interval market pasti per 300 detik (5 menit).
-        """
         now = time.time()
-        
-        # Bulatkan waktu ke bawah ke kelipatan 5 menit (300 detik)
         ts_current = int(now // 300) * 300
-        
-        # Targetkan slug persis untuk 5 menit ini dan 5 menit ke depan (jaga-jaga perpindahan menit)
         slugs_to_try = [
             f"{coin.lower()}-updown-5m-{ts_current}",
             f"{coin.lower()}-updown-5m-{ts_current + 300}"
         ]
-        
         try:
             for slug in slugs_to_try:
                 resp = requests.get(
                     f"{GAMMA_BASE_URL}/events",
-                    params={"slug": slug, "active": "true"}, # Panggil langsung API Slug
+                    params={"slug": slug, "active": "true"},
                     timeout=5,
                 )
                 if resp.status_code != 200:
                     continue
-                    
                 events = resp.json()
                 if not isinstance(events, list) or len(events) == 0:
                     continue
-                    
                 ev = events[0]
                 markets = ev.get("markets", [])
                 if not markets:
                     continue
-                
                 m = markets[0]
                 if not m.get("acceptingOrders", False):
                     continue
-                    
                 result = self._parse_market_dict(m, coin)
-                
-                # Tambahan pengaman waktu
                 if result and self._is_target_window(result.get("end_date", "")):
                     result["question"] = ev.get("title", result.get("question", ""))
                     return result
         except Exception as e:
             logger.debug(f"[Executor] _fetch_market_via_events({coin}) Error: {e}")
-            
         return None
 
     def _fetch_market_via_clob(self, coin: str) -> Optional[dict]:
@@ -478,11 +464,6 @@ class PolymarketExecutor:
     # ── Order placement ───────────────────────────────────────
 
     def _get_best_ask_live(self, token_id: str) -> Optional[float]:
-        """
-        Ambil best ask LIVE dari order book CLOB tepat sebelum submit order.
-        Ini memastikan price yang dikirim selalu ada counterparty-nya.
-        Returns float (harga) atau None jika gagal.
-        """
         try:
             r = requests.get(
                 f"{CLOB_BASE_URL}/book",
@@ -495,7 +476,6 @@ class PolymarketExecutor:
             asks = book.get("asks", [])
             if not asks:
                 return None
-            # asks sudah sorted ascending by price → index 0 = cheapest ask
             best = float(asks[0].get("price", 0))
             if 0.01 < best < 0.99:
                 return best
@@ -505,10 +485,6 @@ class PolymarketExecutor:
 
     def _submit_fok(self, token_id: str, amount_dec: float, price_dec: float,
                     side: str, direction: str) -> bool:
-        """
-        Submit satu FOK order. Return True jika filled, False jika killed/error.
-        Raise exception jika non-FOK error (auth, dll).
-        """
         from py_clob_client.clob_types import MarketOrderArgs, OrderType, PartialCreateOrderOptions
 
         market_args = MarketOrderArgs(
@@ -534,7 +510,6 @@ class PolymarketExecutor:
             logger.info(f"[Executor] ✓ FILLED {direction} ${amount_dec:.2f} @ {price_dec:.2f}")
             return True
 
-        # Cek apakah ini FOK kill (bisa di-retry) atau error lain
         status = resp.get("status", "unknown") if resp else "no_response"
         err_msg = resp.get("error", "") if resp else ""
         is_fok_kill = (
@@ -544,9 +519,8 @@ class PolymarketExecutor:
         )
         if is_fok_kill:
             logger.warning(f"[Executor] FOK killed @ {price_dec:.2f} (no liquidity at this price)")
-            return False  # Bisa di-retry dengan price lebih tinggi
+            return False
 
-        # Status lain = kemungkinan error serius
         logger.warning(f"[Executor] Order not filled: status={status} err={err_msg[:100]}")
         return False
 
@@ -571,18 +545,14 @@ class PolymarketExecutor:
         if amount_d <= 0:
             return False
 
-        # Ambil best ask live → gunakan sebagai price floor
         live_ask = self._get_best_ask_live(token_id)
         if live_ask:
             logger.info(f"[Executor] Live best ask: {live_ask:.2f} | signal price: {price:.4f}")
-            # Gunakan harga yang lebih tinggi antara signal price dan best ask
-            # (agar order pasti ada counterparty-nya)
             effective_price = max(price, live_ask)
         else:
             effective_price = price
             logger.debug(f"[Executor] No live ask, using signal price: {price:.4f}")
 
-        # Round ke tick
         price_d   = Decimal(str(effective_price)).quantize(TICK_2, rounding=ROUND_HALF_UP)
         price_dec = float(price_d)
 
@@ -592,9 +562,8 @@ class PolymarketExecutor:
 
         logger.info(f"[Executor] place_order {direction}: amount={amount_dec} @ price={price_dec}")
 
-        # FOK dengan retry — naikkan price 1 tick per attempt
         MAX_FOK_RETRIES = 3
-        MAX_PRICE       = 0.97  # Jangan mau bayar > 97 sen
+        MAX_PRICE       = 0.97
 
         try:
             from py_clob_client.clob_types import MarketOrderArgs, OrderType, PartialCreateOrderOptions
@@ -616,13 +585,11 @@ class PolymarketExecutor:
                         return True
                 except Exception as e:
                     err = str(e).lower()
-                    # FOK "couldn't be fully filled" → lanjut retry dengan harga lebih tinggi
                     if "fok" in err or "fully filled" in err or "couldn't be" in err:
                         logger.warning(
                             f"[Executor] FOK exception @ {current_price_dec:.2f}: {str(e)[:80]}"
                         )
                         continue
-                    # Error lain (auth, format, dll) → jangan retry
                     self._log_order_err(e, direction)
                     return False
 
@@ -641,22 +608,30 @@ class PolymarketExecutor:
                    side: str, direction: str) -> bool:
         """
         Fallback: kirim sebagai GTC (Good Till Cancelled).
-        GTC akan masuk ke order book dan diisi saat ada likuiditas.
-        Cocok sebagai fallback saat FOK gagal karena market tipis.
+
+        BUG #2 FIX: create_order() expects LimitOrderArgs object, bukan dict biasa.
+        Sebelumnya: self._client.create_order({"token_id": ..., "price": ..., ...}, options)
+        → crash: 'dict' object has no attribute 'token_id'
+
+        Sekarang: gunakan LimitOrderArgs object yang benar.
         """
         try:
-            from py_clob_client.clob_types import CreateOrderOptions, OrderType
-
-            options = CreateOrderOptions(tick_size=POLYMARKET_TICK_STR, neg_risk=False)
-            signed = self._client.create_order(
-                {
-                    "token_id": token_id,
-                    "price":    price_dec,
-                    "size":     amount_dec,
-                    "side":     side,
-                },
-                options,
+            from py_clob_client.clob_types import (
+                CreateOrderOptions,
+                OrderType,
+                LimitOrderArgs,
             )
+
+            # Gunakan LimitOrderArgs object — bukan dict
+            order_args = LimitOrderArgs(
+                token_id=token_id,
+                price=price_dec,
+                size=amount_dec,
+                side=side,
+            )
+            options = CreateOrderOptions(tick_size=POLYMARKET_TICK_STR, neg_risk=False)
+            signed  = self._client.create_order(order_args, options)
+
             if signed is None:
                 logger.error("[Executor] GTC create_order returned None")
                 return False
@@ -670,8 +645,41 @@ class PolymarketExecutor:
             logger.warning(f"[Executor] GTC not accepted: {resp}")
             return False
 
+        except ImportError:
+            # LimitOrderArgs tidak tersedia di versi library ini — coba fallback lama
+            logger.warning("[Executor] LimitOrderArgs tidak tersedia, coba fallback dict GTC")
+            return self._place_gtc_legacy(token_id, amount_dec, price_dec, side, direction)
         except Exception as e:
             logger.error(f"[Executor] GTC fallback error: {e}")
+            return False
+
+    def _place_gtc_legacy(self, token_id: str, amount_dec: float, price_dec: float,
+                          side: str, direction: str) -> bool:
+        """
+        Legacy GTC fallback jika LimitOrderArgs tidak tersedia di versi library lama.
+        Ini adalah versi sebelum fix — hanya dipakai jika import LimitOrderArgs gagal.
+        """
+        try:
+            from py_clob_client.clob_types import CreateOrderOptions, OrderType
+            options = CreateOrderOptions(tick_size=POLYMARKET_TICK_STR, neg_risk=False)
+            signed  = self._client.create_order(
+                {
+                    "token_id": token_id,
+                    "price":    price_dec,
+                    "size":     amount_dec,
+                    "side":     side,
+                },
+                options,
+            )
+            if signed is None:
+                return False
+            resp = self._client.post_order(signed, OrderType.GTC)
+            if resp and resp.get("status") in ("live", "matched", "LIVE", "MATCHED"):
+                logger.info(f"[Executor] ✓ GTC legacy LIVE {direction} @ {price_dec:.2f}")
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"[Executor] GTC legacy error: {e}")
             return False
 
     def _eval_resp(self, resp, direction: str, amount: float, price_dec: float) -> bool:
