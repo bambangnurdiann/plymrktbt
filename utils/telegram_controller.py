@@ -220,8 +220,17 @@ class TelegramController:
         )
 
     def notify_bet(self, coin: str, direction: str, amount: float,
-                   odds: float, beat: float, price: float, window_id: str) -> None:
+                   odds: float, beat: float, price: float, window_id: str,
+                   beat_source: str = "UNKNOWN", beat_reliable: bool = True) -> None:
         arrow = "⬆️" if direction == "UP" else "⬇️"
+        
+        # Warning jika beat tidak reliable
+        beat_warn = ""
+        if not beat_reliable:
+            beat_warn = f"\n⚠️ <i>Beat dari {beat_source} — mungkin ≠ Polymarket!</i>"
+            
+        beat_src_icon = "🔗" if beat_source == "CHAINLINK" else "⚠️"
+        
         self.send(
             f"{arrow} <b>BET {direction} — {coin}</b>\n"
             f"━━━━━━━━━━━━━━━\n"
@@ -229,7 +238,8 @@ class TelegramController:
             f"Amount : <b>${amount:.2f} USDC</b>\n"
             f"Odds   : {odds:.4f}\n"
             f"Price  : ${price:,.2f}\n"
-            f"Beat   : ${beat:,.2f} ({price-beat:+.2f})"
+            f"Beat   : {beat_src_icon} ${beat:,.2f} ({price-beat:+.2f}) [{beat_source}]"
+            f"{beat_warn}"
         )
 
     def notify_result(self, coin: str, direction: str, result: str,
