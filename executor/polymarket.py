@@ -5,16 +5,15 @@ Eksekutor order ke Polymarket via CLOB (Central Limit Order Book) API.
 
 Revisi:
   - Implementasi Gamma API Slug Fetching berdasarkan dokumentasi Polymarket.
-  - Generasi Timestamp akurat untuk membidik market 5-menit (interval 300 detik).
-
-FIXES:
-  - BUG #2: _place_gtc() sekarang pakai LimitOrderArgs object (bukan dict)
-            agar tidak crash dengan "'dict' object has no attribute 'token_id'"
+  - Generasi Timestamp akurat untuk membidik market 5-menit.
+  - FIX: Auto-extract Strike Price (Price To Beat) dari outcomes & groupItemThreshold!
+  - FIX: Support keyword "ABOVE" & "BELOW" pada field outcomes.
 """
 
 import logging
 import os
 import time
+import re
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from typing import Optional
 from datetime import datetime, timezone
@@ -365,6 +364,48 @@ class PolymarketExecutor:
             logger.debug(f"[Executor] _fetch_market_via_search({coin}): {e}")
         return None
 
+    def _extract_strike_price(self, m: dict) -> Optional[float]:
+        """
+        Mengekstrak Strike Price (Price To Beat) dari API Response Polymarket.
+        Membaca field resmi `groupItemThreshold` atau mencari di dalam array `outcomes`.
+        """
+        # 1. Coba groupItemThreshold (Field resmi Polymarket)
+        try:
+            val = float(m.get("groupItemThreshold", 0))
+            if val > 100: return val
+        except Exception:
+            pass
+
+        # 2. Cari di outcomes, title, question, description
+        def parse_field(val):
+            if isinstance(val, list): return val
+            if isinstance(val, str):
+                try: import json; return json.loads(val)
+                except Exception: return [val]
+            return []
+
+        texts = []
+        texts.extend([str(o) for o in parse_field(m.get("outcomes", []))])
+        texts.append(m.get("title", ""))
+        texts.append(m.get("question", ""))
+        texts.append(m.get("description", ""))
+
+        for text in texts:
+            if not text: continue
+            # Cari angka desimal seperti $77,424.24 atau 77424.24
+            match = re.search(r'\$?([0-9]{1,3}(?:,[0-9]{3})*\.\d+)', text)
+            if not match:
+                # Cari angka bulat TAPI harus ada $ untuk mencegah false positive
+                match = re.search(r'\$([0-9]{2,3}(?:,[0-9]{3})*)', text)
+            if match:
+                try:
+                    val = float(match.group(1).replace(',', ''))
+                    if val > 100:
+                        return val
+                except Exception:
+                    pass
+        return None
+
     def _parse_market_dict(self, m: dict, coin: str) -> Optional[dict]:
         token_up = token_down = None
         def parse_field(val):
@@ -377,22 +418,30 @@ class PolymarketExecutor:
         clob_ids = parse_field(m.get("clobTokenIds", []))
         outcomes = parse_field(m.get("outcomes", []))
 
+        # Support untuk pattern outcomes modern seperti ["Above $77,424.24", "Below $77,424.24"]
         if len(clob_ids) >= 2 and len(outcomes) >= 2:
             for i, out in enumerate(outcomes):
                 out_str = str(out).strip().upper()
-                if out_str in ("UP", "HIGHER", "YES") and i < len(clob_ids): token_up = clob_ids[i]
-                elif out_str in ("DOWN", "LOWER", "NO") and i < len(clob_ids): token_down = clob_ids[i]
+                if ("UP" in out_str or "HIGHER" in out_str or "YES" in out_str or "ABOVE" in out_str) and i < len(clob_ids): 
+                    token_up = clob_ids[i]
+                elif ("DOWN" in out_str or "LOWER" in out_str or "NO" in out_str or "BELOW" in out_str) and i < len(clob_ids): 
+                    token_down = clob_ids[i]
         elif len(clob_ids) >= 2:
             token_up, token_down = clob_ids[0], clob_ids[1]
 
         if not (token_up and token_down):
             for t in parse_field(m.get("tokens", [])):
                 if not isinstance(t, dict): continue
-                out = t.get("outcome", "").upper()
-                if out in ("UP", "HIGHER", "YES"): token_up = t.get("token_id") or t.get("tokenId")
-                elif out in ("DOWN", "LOWER", "NO"): token_down = t.get("token_id") or t.get("tokenId")
+                out = str(t.get("outcome", "")).upper()
+                if "UP" in out or "HIGHER" in out or "YES" in out or "ABOVE" in out: 
+                    token_up = t.get("token_id") or t.get("tokenId")
+                elif "DOWN" in out or "LOWER" in out or "NO" in out or "BELOW" in out: 
+                    token_down = t.get("token_id") or t.get("tokenId")
 
         if not (token_up and token_down): return None
+        
+        strike_price = self._extract_strike_price(m)
+
         return {
             "coin":          coin,
             "market_id":     m.get("conditionId") or m.get("condition_id") or m.get("id"),
@@ -400,13 +449,20 @@ class PolymarketExecutor:
             "token_id_up":   token_up,
             "token_id_down": token_down,
             "end_date":      m.get("endDate") or m.get("endDateIso") or m.get("end_date_iso", ""),
+            "strike_price":  strike_price,
         }
 
-    # ── Odds ──────────────────────────────────────────────────
+    # ── Odds & AUTO-STRIKE SYNC ───────────────────────────────
 
     def get_odds(self, market: dict) -> tuple:
+        """
+        Ambil odds dari Gamma API.
+        SEKALIGUS: Mengekstrak Strike Price (Price To Beat) jika Gamma API
+        baru saja meng-update informasinya.
+        """
         now       = time.time()
         cache_key = market.get("market_id", "")
+        
         if cache_key and (now - self._odds_cache_time) < 3:
             cached = self._odds_cache.get(cache_key)
             if cached: return cached
@@ -414,6 +470,7 @@ class PolymarketExecutor:
         try:
             cond_id = market.get("market_id", "")
             resp    = requests.get(f"{GAMMA_BASE_URL}/markets", params={"conditionId": cond_id}, timeout=4)
+            
             if resp.status_code == 200:
                 import json as _json
                 data    = resp.json()
@@ -422,6 +479,14 @@ class PolymarketExecutor:
                 if not target and markets: target = markets[0]
 
                 if target:
+                    # ====================================================
+                    # Sinkronisasi Strike Price Berulang
+                    # ====================================================
+                    if not market.get("strike_price"):
+                        strike = self._extract_strike_price(target)
+                        if strike:
+                            market["strike_price"] = strike
+
                     raw      = target.get("outcomePrices", "[]")
                     prices   = _json.loads(raw) if isinstance(raw, str) else raw
                     out_raw  = target.get("outcomes", "[]")
@@ -432,8 +497,10 @@ class PolymarketExecutor:
                         if len(outcomes) >= 2:
                             for i, out in enumerate(outcomes):
                                 out_u = str(out).upper()
-                                if out_u in ("UP", "HIGHER", "YES") and i < len(prices): odds_up = float(prices[i])
-                                elif out_u in ("DOWN", "LOWER", "NO") and i < len(prices): odds_down = float(prices[i])
+                                if ("UP" in out_u or "HIGHER" in out_u or "YES" in out_u or "ABOVE" in out_u) and i < len(prices): 
+                                    odds_up = float(prices[i])
+                                elif ("DOWN" in out_u or "LOWER" in out_u or "NO" in out_u or "BELOW" in out_u) and i < len(prices): 
+                                    odds_down = float(prices[i])
                         else:
                             odds_up, odds_down = float(prices[0]), float(prices[1])
 
@@ -445,6 +512,7 @@ class PolymarketExecutor:
                             return result
         except Exception: pass
 
+        # Fallback ke CLOB jika Gamma gagal
         try:
             token_up, token_down = market["token_id_up"], market["token_id_down"]
             r1 = requests.get(f"{CLOB_BASE_URL}/midpoints", params={"token_ids": f"{token_up},{token_down}"}, timeout=3)
@@ -525,13 +593,6 @@ class PolymarketExecutor:
         return False
 
     def place_order(self, token_id: str, amount: float, side: str, price: float, direction: str) -> bool:
-        """
-        Submit FOK order dengan smart retry:
-        1. Ambil best ask live dari order book
-        2. Gunakan max(input_price, best_ask) sebagai starting price
-        3. Jika FOK killed, naikkan price 1 tick dan retry (max 3x)
-        4. Jika semua FOK gagal, fallback ke GTC (Good Till Cancelled)
-        """
         if self.dry_run:
             logger.info(f"[Executor] DRY_RUN: {direction} ${amount:.2f} @ {price:.4f}")
             return True
@@ -593,7 +654,6 @@ class PolymarketExecutor:
                     self._log_order_err(e, direction)
                     return False
 
-            # Semua FOK gagal → fallback ke GTC
             logger.warning(f"[Executor] Semua FOK gagal, fallback ke GTC @ {price_dec:.2f}")
             return self._place_gtc(token_id, amount_dec, price_dec, side, direction)
 
@@ -606,23 +666,9 @@ class PolymarketExecutor:
 
     def _place_gtc(self, token_id: str, amount_dec: float, price_dec: float,
                    side: str, direction: str) -> bool:
-        """
-        Fallback: kirim sebagai GTC (Good Till Cancelled).
-
-        BUG #2 FIX: create_order() expects LimitOrderArgs object, bukan dict biasa.
-        Sebelumnya: self._client.create_order({"token_id": ..., "price": ..., ...}, options)
-        → crash: 'dict' object has no attribute 'token_id'
-
-        Sekarang: gunakan LimitOrderArgs object yang benar.
-        """
         try:
-            from py_clob_client.clob_types import (
-                CreateOrderOptions,
-                OrderType,
-                LimitOrderArgs,
-            )
+            from py_clob_client.clob_types import CreateOrderOptions, OrderType, LimitOrderArgs
 
-            # Gunakan LimitOrderArgs object — bukan dict
             order_args = LimitOrderArgs(
                 token_id=token_id,
                 price=price_dec,
@@ -646,7 +692,6 @@ class PolymarketExecutor:
             return False
 
         except ImportError:
-            # LimitOrderArgs tidak tersedia di versi library ini — coba fallback lama
             logger.warning("[Executor] LimitOrderArgs tidak tersedia, coba fallback dict GTC")
             return self._place_gtc_legacy(token_id, amount_dec, price_dec, side, direction)
         except Exception as e:
@@ -655,10 +700,6 @@ class PolymarketExecutor:
 
     def _place_gtc_legacy(self, token_id: str, amount_dec: float, price_dec: float,
                           side: str, direction: str) -> bool:
-        """
-        Legacy GTC fallback jika LimitOrderArgs tidak tersedia di versi library lama.
-        Ini adalah versi sebelum fix — hanya dipakai jika import LimitOrderArgs gagal.
-        """
         try:
             from py_clob_client.clob_types import CreateOrderOptions, OrderType
             options = CreateOrderOptions(tick_size=POLYMARKET_TICK_STR, neg_risk=False)

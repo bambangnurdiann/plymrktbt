@@ -15,7 +15,8 @@ Perubahan utama:
 
 FIXES:
   - BUG #1: Arbiter sekarang di-lock TERLEPAS dari hasil order (stop 532 FOK spam)
-  - BUG #2: Harga Beat sekarang memprioritaskan Chainlink di awal window, serta mengirim peringatan reliabilitas sumber harga.
+  - BUG #2: Harga Beat sekarang memprioritaskan Chainlink di awal window.
+  - BUG #3: (ULTIMATE FIX) Auto-Sync Price to Beat dari Polymarket API.
 """
 
 import asyncio
@@ -281,6 +282,10 @@ def render_dashboard(
 
         beat_dist = abs(price - beat) if price and beat else None
         beat_str  = f"${beat:,.2f}" if beat else dim("N/A")
+        
+        # Tambahkan indikator visual jika beat sudah tersinkronisasi
+        beat_src_lbl = cyan(" [API✓]") if eng.candle.beat_source == "POLYMARKET_API" else ""
+        
         dist_str  = (green if beat_dist and beat_dist >= 60 else
                      yellow if beat_dist else dim)(
                         f"Δ${beat_dist:.0f}" if beat_dist is not None else "Δ N/A")
@@ -324,7 +329,7 @@ def render_dashboard(
         liq_section = _liq_bar(data.liq_short_3s, data.liq_long_3s) if not liq_no_data \
                       else red("Liq:NO-DATA    ")
         row(f"  Liq:[{liq_section}]  "
-            f"Beat:{yellow(beat_str)}  {dist_str}{cl_edge_str}")
+            f"Beat:{yellow(beat_str)}{beat_src_lbl}  {dist_str}{cl_edge_str}")
 
         bar = _candle_bar(elapsed)
         row(f"  {bar} t={elapsed:.0f}s rem={cyan(f'{remaining:.0f}s')}  "
@@ -405,11 +410,24 @@ async def odds_loop(state: BotState, engines: Dict[str, CoinEngine], executor: P
     while True:
         for coin in ACTIVE_COINS:
             try:
-                market = executor.get_active_market(coin)
+                # get_active_market hanya fetch cache, TAPI...
+                market = executor.get_active_market(coin, force_refresh=False)
                 if market:
+                    # ...get_odds MURNI nge-hit API Gamma tiap 3 detik!
+                    # Di dalam get_odds, ada INJEKSI data "strike_price" secara otomatis.
                     up, down = executor.get_odds(market)
                     state.odds[coin] = (up, down)
-                    engines[coin].update_odds(up, down)
+                    
+                    eng = engines.get(coin)
+                    if eng:
+                        eng.update_odds(up, down)
+                        
+                        # === SINKRONISASI STRIKE PRICE RESMI DARI POLYMARKET UI ===
+                        strike = market.get("strike_price")
+                        if strike and strike > 0:
+                            if eng.candle.beat_price != strike and eng.candle.beat_source != "POLYMARKET_API":
+                                eng.candle.set_beat_from_api(strike)
+                                logger.info(f"[{coin}] 🎯 Price To Beat disinkronkan dengan UI Polymarket: ${strike:,.2f}")
             except Exception as e:
                 logger.debug(f"[Odds] {coin}: {e}")
         await asyncio.sleep(3)
@@ -568,13 +586,9 @@ def execute_bet(
     ok = executor.place_order(token_id=token_id, amount=state.bet_amount,
                                side="BUY", price=odds, direction=direction)
 
-    # ── BUG #1 FIX ────────────────────────────────────────────
     # Lock arbiter TERLEPAS dari hasil order.
-    # Sebelumnya hanya di-lock jika ok=True, menyebabkan bot retry
-    # 532x di satu window karena loop 0.3 detik tidak berhenti.
     eng.mark_bet_done()
     arbiter.mark_executed()
-    # ──────────────────────────────────────────────────────────
 
     if ok:
         cl_edge = cl_fair_odds = cl_vol = 0.0
@@ -615,6 +629,8 @@ def execute_bet(
             liq_long_30s=liq_l30,
             coin=coin,
             market_id=market.get("market_id", ""),
+            beat_source=beat_source,      
+            beat_reliable=beat_reliable,  
         )
         logger.info(f"[Bet] ✓ {coin} {direction}")
         state.tg.notify_bet(
@@ -691,7 +707,7 @@ async def main_loop(
         # 3. Circuit breaker check
         cb_ok, _ = state.circuit_breaker.can_bet()
 
-        # 4. Tick semua coin — FIXED: set beat dari Chainlink di awal window
+        # 4. Tick semua coin
         for coin in ACTIVE_COINS:
             eng  = engines[coin]
             data = mws.coins.get(coin)
@@ -699,7 +715,6 @@ async def main_loop(
                 signals[coin] = None
                 continue
 
-            # FIXED: Set beat dari Chainlink saat window baru dimulai
             if cl_monitor and eng.candle.is_new_window:
                 cl_price = cl_monitor.get_price(coin)
                 if cl_price and cl_price > 0:

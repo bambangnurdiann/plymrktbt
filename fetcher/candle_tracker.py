@@ -4,15 +4,10 @@ fetcher/candle_tracker.py
 Tracker window 5 menit Polymarket BTC.
 
 FIX KRITIS:
-  - Beat price sekarang tracking source ("CHAINLINK" / "HYPERLIQUID")
+  - Beat price sekarang tracking source ("CHAINLINK" / "HYPERLIQUID" / "POLYMARKET_API")
   - Chainlink beat TIDAK bisa di-override oleh Hyperliquid
   - Tambah is_beat_reliable, beat_source, beat_set_elapsed
   - set_beat_from_chainlink() dan set_beat_from_hyperliquid() sebagai shortcut
-
-Root cause bug WIN/LOSS mismatch:
-  Bot sebelumnya pakai harga Hyperliquid sebagai beat price.
-  Hyperliquid = perpetual futures, bisa beda $20-50 dari Chainlink spot.
-  Polymarket resolve pakai Chainlink. Akibatnya hasil resolve berbeda.
 """
 
 import time
@@ -24,17 +19,8 @@ class CandleTracker:
     """
     Tracker window 5 menit Polymarket BTC.
 
-    PENTING: Beat price HARUS dari Chainlink, bukan Hyperliquid.
+    PENTING: Beat price HARUS dari Chainlink atau API Polymarket.
     Polymarket menggunakan harga Chainlink sebagai "price to beat".
-
-    Attributes:
-        window_id         : str   — ID unik window (format: "YYYYMMDD-HHMM")
-        window_start      : float — Unix timestamp saat window dimulai
-        window_end        : float — Unix timestamp saat window berakhir
-        beat_price        : float — Harga Chainlink saat window dibuka
-        beat_source       : str   — "CHAINLINK" / "HYPERLIQUID" / "UNKNOWN"
-        beat_set_elapsed  : float — elapsed detik saat beat di-set
-        is_new_window     : bool  — True jika window baru saja berganti
     """
 
     WINDOW_DURATION      = 300  # 5 menit
@@ -90,19 +76,12 @@ class CandleTracker:
     def set_beat_price(self, price: float, source: str = "HYPERLIQUID") -> bool:
         """
         Set beat price untuk window saat ini.
-
-        Rules:
-          1. Jika sudah ada dari CHAINLINK → tidak bisa di-override apapun
-          2. Jika belum ada → terima dari sumber manapun
-          3. Catat elapsed saat beat di-set untuk keperluan diagnostik
-
-        Returns True jika berhasil di-set, False jika ditolak.
         """
         if not price or price <= 0:
             return False
 
-        # Sudah ada dari Chainlink → jangan override
-        if self.beat_price is not None and self.beat_source == "CHAINLINK":
+        # Sudah ada dari Chainlink atau API → jangan override
+        if self.beat_price is not None and self.beat_source in ("CHAINLINK", "POLYMARKET_API"):
             return False
 
         self.beat_price       = price
@@ -114,14 +93,13 @@ class CandleTracker:
     def set_beat_from_chainlink(self, price: float) -> bool:
         """
         Set beat dari Chainlink — ini yang paling akurat dan sesuai Polymarket.
-        Override beat Hyperliquid jika sudah ada.
         """
         if not price or price <= 0:
             return False
 
-        # Chainlink boleh override Hyperliquid (lebih akurat)
-        if self.beat_price is not None and self.beat_source == "CHAINLINK":
-            return False  # Sudah dari CL, tidak perlu update
+        # Hanya API Polymarket yang boleh override Chainlink (kalau ada selisih API telat)
+        if self.beat_price is not None and self.beat_source == "POLYMARKET_API":
+            return False
 
         self.beat_price       = price
         self.beat_source      = "CHAINLINK"
@@ -132,24 +110,33 @@ class CandleTracker:
     def set_beat_from_hyperliquid(self, price: float) -> bool:
         """
         Set beat dari Hyperliquid — fallback jika Chainlink tidak tersedia.
-        Tidak akan override jika sudah ada dari Chainlink.
         """
-        if self.beat_source == "CHAINLINK":
-            return False  # Pertahankan beat Chainlink
+        if self.beat_source in ("CHAINLINK", "POLYMARKET_API"):
+            return False  # Pertahankan beat yang lebih akurat
         return self.set_beat_price(price, source="HYPERLIQUID")
+
+    def set_beat_from_api(self, price: float) -> bool:
+        """
+        Set beat price RESMI dari API Polymarket (100% Akurat).
+        Ini akan override semua harga tebakan sebelumnya.
+        """
+        if not price or price <= 0:
+            return False
+        
+        self.beat_price       = price
+        self.beat_source      = "POLYMARKET_API"
+        self.beat_set_elapsed = self.elapsed
+        self.beat_set_at      = time.time()
+        return True
 
     @property
     def is_beat_reliable(self) -> bool:
         """
         True jika beat price kemungkinan akurat (sama dengan Polymarket).
-
-        Reliable jika:
-          - Source = CHAINLINK, atau
-          - Source = HYPERLIQUID tapi di-set dalam 10 detik pertama window
         """
         if self.beat_price is None:
             return False
-        if self.beat_source == "CHAINLINK":
+        if self.beat_source in ("CHAINLINK", "POLYMARKET_API"):
             return True
         if self.beat_source == "HYPERLIQUID" and self.beat_set_elapsed <= 10:
             return True
@@ -160,7 +147,7 @@ class CandleTracker:
         """Peringatan tentang akurasi beat price, kosong jika aman."""
         if self.beat_price is None:
             return "Beat price belum tersedia"
-        if self.beat_source == "CHAINLINK":
+        if self.beat_source in ("CHAINLINK", "POLYMARKET_API"):
             return ""
         if self.beat_source == "HYPERLIQUID":
             if self.beat_set_elapsed <= 10:
