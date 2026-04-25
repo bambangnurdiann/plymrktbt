@@ -15,6 +15,7 @@ Perubahan utama:
 
 FIXES:
   - BUG #1: Arbiter sekarang di-lock TERLEPAS dari hasil order (stop 532 FOK spam)
+  - BUG #2: Harga Beat sekarang memprioritaskan Chainlink di awal window, serta mengirim peringatan reliabilitas sumber harga.
 """
 
 import asyncio
@@ -544,6 +545,18 @@ def execute_bet(
     remaining = eng.candle.remaining
     market    = executor.get_active_market(coin, force_refresh=True)
 
+    # Log beat source untuk debugging
+    beat_source   = getattr(eng.candle, "beat_source", "UNKNOWN")
+    beat_reliable = getattr(eng.candle, "is_beat_reliable", True)
+
+    if not beat_reliable:
+        logger.warning(
+            f"[Bet] ⚠️  Beat price {coin} TIDAK RELIABLE "
+            f"(source={beat_source}, "
+            f"set_at=t={getattr(eng.candle, 'beat_set_elapsed', 0):.0f}s) "
+            f"— kemungkinan beda dari Polymarket!"
+        )
+
     if not market:
         logger.warning(f"[Bet] Tidak ada market aktif untuk {coin}")
         state.tg.notify_error(f"Tidak ada market aktif untuk {coin}")
@@ -609,6 +622,8 @@ def execute_bet(
             amount=state.bet_amount, odds=odds,
             beat=beat, price=price or 0,
             window_id=eng.candle.window_id,
+            beat_source=beat_source,      
+            beat_reliable=beat_reliable,  
         )
     else:
         logger.warning(f"[Bet] ✗ {coin} {direction} — order gagal, window dilewati")
@@ -676,17 +691,24 @@ async def main_loop(
         # 3. Circuit breaker check
         cb_ok, _ = state.circuit_breaker.can_bet()
 
-        # 4. Tick semua coin
+        # 4. Tick semua coin — FIXED: set beat dari Chainlink di awal window
         for coin in ACTIVE_COINS:
             eng  = engines[coin]
             data = mws.coins.get(coin)
             if not data:
                 signals[coin] = None
                 continue
-            price = data.get_price()
-            if price and eng.candle.elapsed < 5:
-                eng.candle.update()
-                eng.candle.set_beat_price(price)
+
+            # FIXED: Set beat dari Chainlink saat window baru dimulai
+            if cl_monitor and eng.candle.is_new_window:
+                cl_price = cl_monitor.get_price(coin)
+                if cl_price and cl_price > 0:
+                    eng.candle.set_beat_from_chainlink(cl_price)
+                    logger.info(
+                        f"[Beat] {coin} window baru — "
+                        f"beat dari Chainlink: ${cl_price:,.2f}"
+                    )
+
             signals[coin] = None if (blocked or not cb_ok) else eng.tick(data)
 
         # 5. Balance check
