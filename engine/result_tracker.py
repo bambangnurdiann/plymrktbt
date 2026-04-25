@@ -7,6 +7,10 @@ Menyimpan semua bet ke CSV dan menghitung:
   - Win rate
   - Total profit/loss
   - Streak (berapa kali menang/kalah berturut-turut)
+
+FIXES:
+  - BUG #3: resolve_source ditambahkan ke CSV_HEADERS dan ditulis di _append_csv()
+            Sebelumnya selalu UNKNOWN di diagnostic karena field ini tidak ter-capture.
 """
 
 import csv
@@ -28,6 +32,8 @@ CSV_HEADERS = [
     "remaining_secs", "odds_spread", "beat_distance",
     "signal_mode", "cl_edge", "cvd_2min",
     "liq_short_3s", "liq_long_3s", "hour_utc",
+    # BUG #3 FIX: tambahkan resolve_source ke header
+    "resolve_source",
 ]
 
 
@@ -248,7 +254,6 @@ class ResultTracker:
         PENTING: close_price yang dipass ke sini harus dari Chainlink,
         bukan dari Hyperliquid, agar konsisten dengan oracle Polymarket.
         """
-        # Cari bet pending untuk window ini
         rec = None
         for r in reversed(self._records):
             if r.window_id == window_id and r.result == "PENDING":
@@ -284,18 +289,6 @@ class ResultTracker:
 
         if won:
             rec.result = "WIN"
-            # Rumus Polymarket yang benar:
-            #   Kamu beli token senilai bet_amount USDC di harga odds
-            #   Jumlah token = bet_amount / odds
-            #   Jika menang, tiap token = $1.00 → payout = bet_amount / odds
-            #   Profit bersih = payout - bet_amount
-            #
-            # Contoh: bet $2 @ odds 0.52
-            #   token = 2 / 0.52 = 3.846
-            #   payout = $3.846  ← ini yang masuk ke wallet Polymarket
-            #   profit = $3.846 - $2.00 = +$1.846
-            #
-            # Sesuai tampilan Polymarket: "Amount Won $3.85 (+$1.85, 92.3%)"
             rec.payout = rec.bet_amount / rec.odds if rec.odds > 0 else 0.0
             rec.pnl    = rec.payout - rec.bet_amount
             self.wins += 1
@@ -338,6 +331,8 @@ class ResultTracker:
                     f"{rec.cl_edge:.4f}", f"{rec.cvd_2min:.0f}",
                     f"{rec.liq_short_3s:.0f}", f"{rec.liq_long_3s:.0f}",
                     str(rec.hour_utc),
+                    # BUG #3 FIX: tulis resolve_source ke CSV
+                    rec.resolve_source,
                 ])
         except Exception as e:
             logger.error(f"[ResultTracker] Gagal write CSV: {e}")
@@ -351,10 +346,6 @@ class ResultTracker:
 
     @property
     def current_streak(self) -> tuple[str, int]:
-        """
-        Streak saat ini.
-        Returns: ("W", 3) untuk 3 menang berturut-turut, atau ("L", 2) untuk 2 kalah.
-        """
         streak_type = None
         count = 0
         for rec in reversed(self._records):
