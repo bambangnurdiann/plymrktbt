@@ -227,8 +227,19 @@ class ChainlinkMonitor:
             logger.info(f"[ChainlinkMonitor] Vol calibrated {coin}: {std:.6f}/min from {len(returns)} samples")
 
     def get_calibrated_vol(self, coin: str) -> float:
+        """
+        Ambil volatility terkalibrasi dengan floor dan ceiling.
+
+        MASALAH #4 FIX: Floor dinaikkan dari 0.0002 → 0.0008.
+        Vol terlalu kecil (0.00025) → sigma kecil → d/z-score besar
+        → prob_up ekstrem (0.97+) → model terlalu yakin → 100% bet UP.
+
+        Dengan floor 0.0008:
+          sigma = 0.0008 * 1.73 * 77000 = $106
+          diff = +66 → d = 66/106 = 0.62 → prob_up ≈ 73%  ← masuk akal
+        """
         vol = self._vol_calibrated.get(coin, 0.001)
-        return max(0.0002, min(0.01, vol))
+        return max(0.0008, min(0.01, vol))  # floor dinaikkan dari 0.0002 ke 0.0008
 
     # ── IMPROVE 2: Momentum filter ────────────────────────────
 
@@ -257,15 +268,15 @@ class ChainlinkMonitor:
     def get_dynamic_min_edge(self, remaining: float, base_min_edge: float = 0.10) -> float:
         """Edge minimum dinamis berdasarkan sisa waktu."""
         if remaining > 240:
-            return base_min_edge * 1.5    # awal window, uncertainty tinggi
+            return base_min_edge * 1.5
         elif remaining > 120:
             return base_min_edge * 1.2
         elif remaining > 60:
-            return base_min_edge          # standard
+            return base_min_edge
         elif remaining > 30:
-            return base_min_edge * 1.3    # zona snipe
+            return base_min_edge * 1.3
         else:
-            return base_min_edge * 1.6    # last seconds
+            return base_min_edge * 1.6
 
     # ── Fair odds calculation ─────────────────────────────────
 
@@ -324,7 +335,7 @@ class ChainlinkMonitor:
     ) -> Optional[MispricingSignal]:
         """
         Detect mispricing dengan 4 filter aktif:
-        1. Auto-calibrated volatility
+        1. Auto-calibrated volatility (dengan floor lebih tinggi)
         2. Momentum check
         3. Time decay edge requirement
         4. Odds spread filter
@@ -344,7 +355,7 @@ class ChainlinkMonitor:
             if use_time_decay else min_edge
         )
 
-        # Calculate fair odds
+        # Calculate fair odds (menggunakan vol dengan floor yang lebih tinggi)
         fair_odds = self.calc_fair_odds(coin, direction, beat_price, remaining, vol_per_min)
         edge      = fair_odds - current_odds
 
