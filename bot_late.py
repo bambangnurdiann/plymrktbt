@@ -12,6 +12,9 @@ Perubahan utama:
   - F5 odds spread wajib (min 0.05)
   - Strength gate minimum 0.4
   - Telegram /resume setelah hard stop
+
+FIXES:
+  - BUG #1: Arbiter sekarang di-lock TERLEPAS dari hasil order (stop 532 FOK spam)
 """
 
 import asyncio
@@ -172,10 +175,6 @@ def render_dashboard(
     def _candle_bar(elapsed: float, total: float = 300,
                     zone_min: float = ENTRY_MIN, zone_max: float = ENTRY_MAX,
                     bar_width: int = 38) -> str:
-        """
-        Progress bar candle dengan entry zone ditandai.
-        Contoh: [====|##ZONE##|======•========]
-        """
         pos      = int(elapsed / total * bar_width)
         z_lo     = int(zone_min / total * bar_width)
         z_hi     = int(zone_max / total * bar_width)
@@ -188,7 +187,6 @@ def render_dashboard(
             else:
                 bar.append("─")
         raw = "[" + "".join(bar) + "]"
-        # Warnai zone dan posisi
         result = ""
         for i, ch in enumerate(raw[1:-1]):
             if ch == "●":
@@ -200,7 +198,6 @@ def render_dashboard(
         return dim("[") + result + dim("]")
 
     def _liq_bar(liq_s: float, liq_l: float, width: int = 12) -> str:
-        """Bar visual liq ratio. Kiri=Short, Kanan=Long."""
         total = liq_s + liq_l
         if total <= 0:
             return dim("─" * width + " N/A")
@@ -218,7 +215,6 @@ def render_dashboard(
         return yellow("→")
 
     def _mini_history(n: int = 12) -> str:
-        """Last N bet results sebagai emoji string."""
         resolved = [r for r in results._records if r.result in ("WIN", "LOSS")]
         recent   = resolved[-n:]
         parts    = []
@@ -229,7 +225,6 @@ def render_dashboard(
         return " ".join(parts)
 
     def _ev_per_bet() -> str:
-        """Expected value per bet berdasarkan histori."""
         if results.total_bets == 0:
             return "N/A"
         ev = results.running_pnl / results.total_bets
@@ -237,7 +232,6 @@ def render_dashboard(
         return c(f"{ev:+.2f}")
 
     def _roi_str() -> str:
-        """ROI dari starting balance."""
         start = getattr(executor, "_starting_balance", 0) or executor.balance
         if start <= 0:
             return "N/A"
@@ -284,21 +278,18 @@ def render_dashboard(
         odds_up, odds_down = state.odds.get(coin, (0.5, 0.5))
         spread    = abs(odds_up - odds_down)
 
-        # Beat distance
         beat_dist = abs(price - beat) if price and beat else None
         beat_str  = f"${beat:,.2f}" if beat else dim("N/A")
         dist_str  = (green if beat_dist and beat_dist >= 60 else
                      yellow if beat_dist else dim)(
                         f"Δ${beat_dist:.0f}" if beat_dist is not None else "Δ N/A")
 
-        # CL edge dari signal
         cl_edge_str = ""
         if sig and sig.chainlink_signal:
             e = sig.chainlink_signal.edge
             ec = green if e >= CL_MIN_EDGE else red
             cl_edge_str = f"  CL:{ec(f'{e:.3f}')}"
 
-        # Signal label
         if sig and sig.should_bet:
             mode_tag  = cyan(" [CL]") if sig.mode == "CHAINLINK" else ""
             sig_label = green(bold(
@@ -322,22 +313,18 @@ def render_dashboard(
         zone_lbl = green("IN-ZONE") if in_zone else (
             dim("PRE") if elapsed < ENTRY_MIN else dim("POST"))
 
-        # Liq ratio
         liq_no_data = (data.liq_short_3s == 0 and data.liq_long_3s == 0)
 
-        # Row 1: price, CVD, odds, spread
         row(f"{bold(f'[{coin}]')} ${price:>11,.2f}  "
             f"CVD:{cvd_c(f'{cvd2/1000:+.0f}k')}{_cvd_arrow(cvd2)}  "
             f"UP={odds_up:.2f}/DN={odds_down:.2f}  "
             f"Spread:{spread_c(f'{spread:.3f}')}")
 
-        # Row 2: Liq bar, beat, beat distance, CL edge
         liq_section = _liq_bar(data.liq_short_3s, data.liq_long_3s) if not liq_no_data \
                       else red("Liq:NO-DATA    ")
         row(f"  Liq:[{liq_section}]  "
             f"Beat:{yellow(beat_str)}  {dist_str}{cl_edge_str}")
 
-        # Row 3: candle progress bar, timing, zone, signal
         bar = _candle_bar(elapsed)
         row(f"  {bar} t={elapsed:.0f}s rem={cyan(f'{remaining:.0f}s')}  "
             f"{zone_lbl}  {sig_label}")
@@ -361,7 +348,6 @@ def render_dashboard(
             row(green(bold(f"  ▶ READY: {best.coin} {best.direction} "
                            f"str={best.strength:.2f} conf={best.confidence:.2f}")) + mode_tag)
         else:
-            # Tunjukkan alasan semua coin skip
             skip_reasons = []
             for coin, sig in signals.items():
                 if sig and not sig.should_bet:
@@ -391,10 +377,8 @@ def render_dashboard(
         f"Streak: L{cb_s.consecutive_losses}/W{cb_s.consecutive_wins}  "
         f"SessL:{cb_s.session_losses}")
 
-    # Mini history
     row(f"  History: {_mini_history(12)}")
 
-    # Active bet
     if results.current_bet:
         cb_r    = results.current_bet
         d_c     = green if cb_r.direction == "UP" else red
@@ -408,7 +392,6 @@ def render_dashboard(
 
     sep()
 
-    # Footer
     master   = engines[ACTIVE_COINS[0]]
     next_win = int(master.candle.remaining)
     row(f"  {dim('[A] Auto  [Ctrl+C] Stop')}   "
@@ -491,7 +474,6 @@ def maybe_claim(state: BotState, executor: PolymarketExecutor) -> None:
         return
     state.last_claim_check = now
 
-    # Cek posisi redeemable tanpa butuh relayer (via DATA API)
     positions = executor.get_redeemable_positions()
     if not positions:
         return
@@ -505,7 +487,6 @@ def maybe_claim(state: BotState, executor: PolymarketExecutor) -> None:
         if not cid:
             continue
 
-        # Estimasi amount yang akan diklaim
         size = float(pos.get("size", pos.get("currentValue", 0)) or 0)
 
         ok = executor.claim_position(cid)
@@ -519,7 +500,6 @@ def maybe_claim(state: BotState, executor: PolymarketExecutor) -> None:
         time.sleep(1)
 
     if claimed_count > 0:
-        # Refresh balance setelah claim agar dashboard akurat
         old_balance = executor.balance
         executor.get_balance()
         balance_gain = executor.balance - old_balance
@@ -529,7 +509,6 @@ def maybe_claim(state: BotState, executor: PolymarketExecutor) -> None:
             f"Saldo: ${old_balance:.2f} → ${executor.balance:.2f} (+${balance_gain:.2f})"
         )
 
-        # Kirim notif Telegram
         state.tg.send(
             f"💰 <b>Auto-Claim Berhasil</b>\n"
             f"━━━━━━━━━━━━━━━\n"
@@ -575,10 +554,16 @@ def execute_bet(
 
     ok = executor.place_order(token_id=token_id, amount=state.bet_amount,
                                side="BUY", price=odds, direction=direction)
-    if ok:
-        eng.mark_bet_done()
-        arbiter.mark_executed()
 
+    # ── BUG #1 FIX ────────────────────────────────────────────
+    # Lock arbiter TERLEPAS dari hasil order.
+    # Sebelumnya hanya di-lock jika ok=True, menyebabkan bot retry
+    # 532x di satu window karena loop 0.3 detik tidak berhenti.
+    eng.mark_bet_done()
+    arbiter.mark_executed()
+    # ──────────────────────────────────────────────────────────
+
+    if ok:
         cl_edge = cl_fair_odds = cl_vol = 0.0
         sig_mode = ""
         if signal:
@@ -626,7 +611,7 @@ def execute_bet(
             window_id=eng.candle.window_id,
         )
     else:
-        logger.warning(f"[Bet] ✗ {coin} {direction}")
+        logger.warning(f"[Bet] ✗ {coin} {direction} — order gagal, window dilewati")
         state.tg.notify_error(f"Order FAILED: {coin} {direction} @ {odds:.4f}")
 
 
@@ -641,7 +626,7 @@ async def main_loop(
     last_dash     = 0.0
     last_balance  = 0.0
     last_resolved = ""
-    _prev_window  = ""   # FIX Bug1: track window sebelumnya untuk deteksi pergantian
+    _prev_window  = ""
 
     logger.info(f"[LateBot] Main loop — coins: {ACTIVE_COINS}")
     logger.info(f"[LateBot] Entry zone: {ENTRY_MIN}-{ENTRY_MAX}s")
@@ -657,7 +642,6 @@ async def main_loop(
         # 1. Telegram commands
         cmd = state.tg.get_pending_command()
         if cmd:
-            # Handle /resume untuk circuit breaker
             if cmd.cmd == "/resume":
                 state.circuit_breaker.force_resume()
                 state.auto_bet = True
@@ -673,17 +657,11 @@ async def main_loop(
         master.candle.update()
         current_win = master.candle.window_id
 
-        # FIX Bug1: Deteksi pergantian window secara eksplisit.
-        # arbiter.reset_for_window() sudah idempoten jika window sama, tapi
-        # ada edge case di mana window_id belum berubah meski candle sudah
-        # bergulir ke sesi baru (elapsed < 2s). Paksa reset juga via elapsed.
         if current_win != _prev_window:
             logger.info(f"[LateBot] Window baru: {_prev_window} → {current_win} | Reset arbiter.")
             arbiter.reset_for_window(current_win)
             _prev_window = current_win
         elif master.candle.elapsed < 3.0 and arbiter.window_bet_done:
-            # Failsafe: elapsed sudah reset ke awal tapi window_id belum update
-            # (bisa terjadi jika ada delay di WebSocket). Paksa reset arbiter.
             logger.warning(
                 f"[LateBot] Failsafe reset: elapsed={master.candle.elapsed:.1f}s "
                 f"tapi arbiter masih locked di window={current_win}. Reset paksa."
@@ -709,14 +687,12 @@ async def main_loop(
             if price and eng.candle.elapsed < 5:
                 eng.candle.update()
                 eng.candle.set_beat_price(price)
-            # Jangan generate sinyal jika blocked atau circuit breaker aktif
             signals[coin] = None if (blocked or not cb_ok) else eng.tick(data)
 
         # 5. Balance check
         if now - last_balance > 30:
             executor.get_balance()
             last_balance = now
-            # Update circuit breaker dengan saldo terbaru
             state.circuit_breaker.check_drawdown(executor.balance)
             if executor.balance < state.bet_amount * 3 and executor.balance > 0:
                 if now - state._last_low_balance_warn > 3600:
@@ -735,26 +711,16 @@ async def main_loop(
             bet_coin = getattr(cb, "coin", "BTC")
             cb_eng   = engines.get(bet_coin, master)
 
-            # FIX Bug2: Pisahkan dua fase resolve:
-            #   Fase 1 (elapsed 5–90s): Coba query Polymarket API dulu.
-            #              Jika API sudah confirmed → resolve + notif Telegram.
-            #   Fase 2 (elapsed 91–180s): API masih belum respond → resolve
-            #              dengan fallback hitung sendiri, tapi tandai sebagai
-            #              UNCONFIRMED agar notif Telegram menampilkan peringatan.
-            #   Fase 3 (elapsed > 180s): Force resolve biar bet tidak stuck selamanya.
-
             elapsed_new = cb_eng.candle.elapsed
             is_new_window = (cb.window_id != current_win)
 
             if is_new_window and cb.window_id != last_resolved:
                 should_try_resolve = (
-                    (5 <= elapsed_new <= 180)   # Fase 1 & 2
-                    or elapsed_new > 180        # Fase 3 force resolve
+                    (5 <= elapsed_new <= 180)
+                    or elapsed_new > 180
                 )
 
                 if should_try_resolve:
-                    # Gunakan Chainlink sebagai close price — sama dengan oracle Polymarket
-                    # Fallback ke Hyperliquid hanya jika Chainlink tidak tersedia
                     cp = None
                     if cl_monitor:
                         cp = cl_monitor.get_price(bet_coin)
@@ -769,29 +735,21 @@ async def main_loop(
                     if cp:
                         market_id = getattr(cb, "market_id", "")
 
-                        # FIX Bug2: Cek apakah Polymarket API sudah konfirmasi hasil.
-                        # Jika belum (market belum closed), jangan resolve dulu
-                        # kecuali sudah masuk fase timeout (elapsed > 90s).
                         polymarket_confirmed = ResultTracker.query_polymarket_result(market_id) if market_id else None
                         api_confirmed = polymarket_confirmed is not None
 
                         if not api_confirmed and elapsed_new < 90:
-                            # Polymarket API belum ready, masih dalam window tunggu wajar.
-                            # Skip resolve iterasi ini, coba lagi di iterasi berikutnya.
                             logger.debug(
                                 f"[Resolve] Polymarket API belum confirmed, "
                                 f"elapsed={elapsed_new:.0f}s — tunggu sebentar lagi."
                             )
                         else:
-                            # Lanjutkan resolve (API confirmed, atau sudah timeout > 90s)
                             rec = results.resolve_bet(cb.window_id, cp, market_id=market_id)
                             if rec:
                                 last_resolved = rec.window_id
 
-                                # Feed circuit breaker
                                 state.circuit_breaker.record_result(rec.result, rec.pnl)
 
-                                # Feed loss analyzer
                                 now_utc = datetime.now(timezone.utc)
                                 ctx = BetContext(
                                     timestamp=rec.timestamp,
@@ -824,8 +782,6 @@ async def main_loop(
                                 if results.total_bets % 20 == 0 and results.total_bets > 0:
                                     state.loss_analyzer.print_report()
 
-                                # FIX Bug2: Tambahkan keterangan sumber hasil di notif Telegram
-                                # agar user tahu apakah hasil sudah confirmed atau masih estimasi.
                                 resolve_src = getattr(rec, "resolve_source", "")
                                 unconfirmed_note = (
                                     "\n⚠️ <i>Hasil estimasi (Polymarket API belum confirmed)</i>"
@@ -933,7 +889,7 @@ async def run():
 
     state    = BotState(bet, starting_balance=starting_balance)
     mws      = MultiWS(ACTIVE_COINS)
-    arbiter  = SignalArbiter(min_strength=0.4)   # dinaikkan dari 0.2
+    arbiter  = SignalArbiter(min_strength=0.4)
     results  = ResultTracker(csv_path="logs/late_bot_results.csv")
 
     cl_monitor = None
